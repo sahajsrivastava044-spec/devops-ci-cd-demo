@@ -1,0 +1,104 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: devops-cicd-demo
+  CONTAINER_NAME: devops-cicd-demo
+  APP_PORT: 3000
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.SHORT_SHA }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set short git SHA
+        id: vars
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.SHORT_SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}"
+            CONTAINER="${{ env.CONTAINER_NAME }}"
+            PORT="${{ env.APP_PORT }}"
+
+            echo "Deploying image: $IMAGE"
+
+            sudo docker pull "$IMAGE"
+
+            if sudo docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
+              echo "Stopping old container..."
+              sudo docker stop "$CONTAINER" || true
+              sudo docker rm "$CONTAINER" || true
+            fi
+
+            echo "Starting new container..."
+            sudo docker run -d \
+              --name "$CONTAINER" \
+              --restart unless-stopped \
+              -p "$PORT:3000" \
+              -e APP_VERSION="${{ needs.build-and-push.outputs.image_tag }}" \
+              "$IMAGE"
+
+            echo "Waiting for app to become healthy..."
+            sleep 5
+
+            curl -f "http://localhost:$PORT/health"
+
+            echo "Deployment successful"
